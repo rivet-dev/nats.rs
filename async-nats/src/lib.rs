@@ -202,6 +202,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error};
 
 use core::fmt;
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Display;
@@ -386,6 +387,7 @@ pub(crate) enum Command {
         subject: Subject,
         queue_group: Option<String>,
         sender: mpsc::Sender<Message>,
+        statistics: Arc<SubscriberStatistics>,
     },
     Unsubscribe {
         sid: u64,
@@ -427,6 +429,7 @@ pub(crate) enum ClientOp {
 struct Subscription {
     subject: Subject,
     sender: mpsc::Sender<Message>,
+    statistics: Arc<SubscriberStatistics>,
     queue_group: Option<String>,
     delivered: u64,
     max: Option<u64>,
@@ -737,6 +740,22 @@ impl ConnectionHandler {
                     // subscription from the map and unsubscribe.
                     match subscription.sender.try_send(message) {
                         Ok(_) => {
+                            subscription
+                                .statistics
+                                .pending_messages
+                                .add(1, Ordering::Relaxed);
+                            subscription
+                                .statistics
+                                .pending_bytes
+                                .add(length as u64, Ordering::Relaxed);
+                            self.connector
+                                .connect_stats
+                                .subscription_pending_messages
+                                .add(1, Ordering::Relaxed);
+                            self.connector
+                                .connect_stats
+                                .subscription_pending_bytes
+                                .add(length as u64, Ordering::Relaxed);
                             subscription.delivered += 1;
                             // if this `Subscription` has set `max` value, check if it
                             // was reached. If yes, remove the `Subscription` and in
@@ -749,6 +768,23 @@ impl ConnectionHandler {
                             }
                         }
                         Err(mpsc::error::TrySendError::Full(returned_message)) => {
+                            let dropped_len = returned_message.length as u64;
+                            subscription
+                                .statistics
+                                .dropped_messages
+                                .add(1, Ordering::Relaxed);
+                            subscription
+                                .statistics
+                                .dropped_bytes
+                                .add(dropped_len, Ordering::Relaxed);
+                            self.connector
+                                .connect_stats
+                                .subscription_dropped_messages
+                                .add(1, Ordering::Relaxed);
+                            self.connector
+                                .connect_stats
+                                .subscription_dropped_bytes
+                                .add(dropped_len, Ordering::Relaxed);
                             debug!("slow consumer detected for subscription {}", sid);
                             self.connector
                                 .events_tx
@@ -856,9 +892,11 @@ impl ConnectionHandler {
                 subject,
                 queue_group,
                 sender,
+                statistics,
             } => {
                 let subscription = Subscription {
                     sender,
+                    statistics,
                     delivered: 0,
                     max: None,
                     subject: subject.to_owned(),
@@ -1263,19 +1301,57 @@ pub struct Subscriber {
     sid: u64,
     receiver: mpsc::Receiver<Message>,
     sender: mpsc::Sender<Command>,
+    statistics: Arc<SubscriberStatistics>,
+    connection_stats: Arc<client::Statistics>,
 }
 
 impl Subscriber {
-    fn new(
+    pub(crate) fn new(
         sid: u64,
         sender: mpsc::Sender<Command>,
         receiver: mpsc::Receiver<Message>,
+        statistics: Arc<SubscriberStatistics>,
+        connection_stats: Arc<client::Statistics>,
     ) -> Subscriber {
+        connection_stats
+            .active_subscriptions
+            .add(1, Ordering::Relaxed);
+        connection_stats
+            .active_subscription_capacity
+            .add(receiver.max_capacity() as u64, Ordering::Relaxed);
+
         Subscriber {
             sid,
             sender,
             receiver,
+            statistics,
+            connection_stats,
         }
+    }
+
+    /// Returns statistics for this subscription handle.
+    pub fn statistics(&self) -> Arc<SubscriberStatistics> {
+        self.statistics.clone()
+    }
+
+    /// Returns the number of messages currently buffered in this subscriber.
+    pub fn pending_messages(&self) -> usize {
+        self.receiver.len()
+    }
+
+    /// Returns the number of bytes currently buffered in this subscriber.
+    pub fn pending_bytes(&self) -> u64 {
+        self.statistics.pending_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the remaining message capacity in this subscriber.
+    pub fn remaining_capacity(&self) -> usize {
+        self.receiver.capacity()
+    }
+
+    /// Returns the maximum message capacity in this subscriber.
+    pub fn max_capacity(&self) -> usize {
+        self.receiver.max_capacity()
     }
 
     /// Unsubscribes from subscription, draining all remaining messages.
@@ -1394,6 +1470,39 @@ impl From<tokio::sync::mpsc::error::SendError<Command>> for UnsubscribeError {
 impl Drop for Subscriber {
     fn drop(&mut self) {
         self.receiver.close();
+        let mut drained_messages = 0;
+        let mut drained_bytes = 0;
+
+        while let Ok(message) = self.receiver.try_recv() {
+            drained_messages += 1;
+            drained_bytes += message.length as u64;
+        }
+
+        if drained_messages > 0 {
+            self.statistics
+                .pending_messages
+                .sub(drained_messages, Ordering::Relaxed);
+            self.connection_stats
+                .subscription_pending_messages
+                .sub(drained_messages, Ordering::Relaxed);
+        }
+
+        if drained_bytes > 0 {
+            self.statistics
+                .pending_bytes
+                .sub(drained_bytes, Ordering::Relaxed);
+            self.connection_stats
+                .subscription_pending_bytes
+                .sub(drained_bytes, Ordering::Relaxed);
+        }
+
+        self.connection_stats
+            .active_subscriptions
+            .sub(1, Ordering::Relaxed);
+        self.connection_stats
+            .active_subscription_capacity
+            .sub(self.receiver.max_capacity() as u64, Ordering::Relaxed);
+
         tokio::spawn({
             let sender = self.sender.clone();
             let sid = self.sid;
@@ -1411,8 +1520,38 @@ impl Stream for Subscriber {
     type Item = Message;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                self.statistics
+                    .pending_messages
+                    .sub(1, Ordering::Relaxed);
+                self.statistics
+                    .pending_bytes
+                    .sub(message.length as u64, Ordering::Relaxed);
+                self.connection_stats
+                    .subscription_pending_messages
+                    .sub(1, Ordering::Relaxed);
+                self.connection_stats
+                    .subscription_pending_bytes
+                    .sub(message.length as u64, Ordering::Relaxed);
+                Poll::Ready(Some(message))
+            }
+            other => other,
+        }
     }
+}
+
+/// Statistics for a single subscription handle.
+#[derive(Default, Debug)]
+pub struct SubscriberStatistics {
+    /// Number of messages currently buffered in this subscription channel.
+    pub pending_messages: AtomicU64,
+    /// Number of bytes currently buffered in this subscription channel.
+    pub pending_bytes: AtomicU64,
+    /// Number of messages dropped because this subscription channel was full.
+    pub dropped_messages: AtomicU64,
+    /// Number of bytes dropped because this subscription channel was full.
+    pub dropped_bytes: AtomicU64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

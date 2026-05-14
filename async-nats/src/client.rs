@@ -21,6 +21,7 @@ use crate::subject::ToSubject;
 use crate::ServerInfo;
 
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
+use crate::SubscriberStatistics;
 use crate::error::Error;
 use bytes::Bytes;
 use futures_util::future::TryFutureExt;
@@ -643,6 +644,7 @@ impl Client {
         let subject = subject.to_subject();
         let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
+        let subscription_statistics = Arc::new(SubscriberStatistics::default());
 
         self.sender
             .send(Command::Subscribe {
@@ -650,10 +652,17 @@ impl Client {
                 subject,
                 queue_group: None,
                 sender,
+                statistics: subscription_statistics.clone(),
             })
             .await?;
 
-        Ok(Subscriber::new(sid, self.sender.clone(), receiver))
+        Ok(Subscriber::new(
+            sid,
+            self.sender.clone(),
+            receiver,
+            subscription_statistics,
+            self.connection_stats.clone(),
+        ))
     }
 
     /// Subscribes to a subject with a queue group to receive [messages][Message].
@@ -681,6 +690,7 @@ impl Client {
 
         let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
+        let subscription_statistics = Arc::new(SubscriberStatistics::default());
 
         self.sender
             .send(Command::Subscribe {
@@ -688,10 +698,17 @@ impl Client {
                 subject,
                 queue_group: Some(queue_group),
                 sender,
+                statistics: subscription_statistics.clone(),
             })
             .await?;
 
-        Ok(Subscriber::new(sid, self.sender.clone(), receiver))
+        Ok(Subscriber::new(
+            sid,
+            self.sender.clone(),
+            receiver,
+            subscription_statistics,
+            self.connection_stats.clone(),
+        ))
     }
 
     /// Flushes the internal buffer ensuring that all messages are sent.
@@ -1010,4 +1027,16 @@ pub struct Statistics {
     /// Number of times connection was established.
     /// Initial connect will be counted as well, then all successful reconnects.
     pub connects: AtomicU64,
+    /// Number of messages currently buffered in subscription channels.
+    pub subscription_pending_messages: AtomicU64,
+    /// Number of bytes currently buffered in subscription channels.
+    pub subscription_pending_bytes: AtomicU64,
+    /// Number of messages dropped because subscription channels were full.
+    pub subscription_dropped_messages: AtomicU64,
+    /// Number of bytes dropped because subscription channels were full.
+    pub subscription_dropped_bytes: AtomicU64,
+    /// Number of currently active subscription handles.
+    pub active_subscriptions: AtomicU64,
+    /// Total configured capacity of currently active subscription channels.
+    pub active_subscription_capacity: AtomicU64,
 }
