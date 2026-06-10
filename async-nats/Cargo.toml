@@ -1,5 +1,5 @@
 [package]
-name = "async-nats"
+name = "rivet-async-nats"
 authors = ["Tomasz Pietrek <tomasz@nats.io>", "Casper Beyer <caspervonb@pm.me>"]
 version = "0.46.0"
 edition = "2021"
@@ -7,8 +7,8 @@ rust-version = "1.88.0"
 description = "A async Rust NATS client"
 license = "Apache-2.0"
 documentation = "https://docs.rs/async-nats"
-homepage = "https://github.com/nats-io/nats.rs"
-repository = "https://github.com/nats-io/nats.rs"
+homepage = "https://github.com/NathanFlurry/nats.rs"
+repository = "https://github.com/NathanFlurry/nats.rs"
 readme = "../README.md"
 keywords = ["nats", "client", "messaging", "api"]
 categories = ["network-programming", "api-bindings"]
