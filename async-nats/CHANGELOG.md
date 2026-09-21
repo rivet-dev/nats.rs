@@ -1,3 +1,92 @@
+# v0.49.1
+## Overview
+Release focusing on fixing behaviour around server connectivity.
+
+## What's Changed
+* Fix ping interval reset by @Jarema in https://github.com/nats-io/nats.rs/pull/1594
+* Fix recreating ordered consumer on server restart by @Jarema in https://github.com/nats-io/nats.rs/pull/1599
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.49.0...async-nats/v0.49.1
+
+# v0.49.0
+## Overview
+
+This is a small release adding missing client-side max-payload validations for some methods.
+It is a minor release as it adds new error kind variants for relevant calls.
+
+## What's Changed
+* Add TryFrom impls for HeaderName by @yordis in https://github.com/nats-io/nats.rs/pull/1587
+* Add max payload validation where it was missing by @Jarema in https://github.com/nats-io/nats.rs/pull/1590
+
+## New Contributors
+* @scottf made their first contribution in https://github.com/nats-io/nats.rs/pull/1579
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.48.0...async-nats/v0.49.0
+
+# v0.48.0
+## Added
+* Add recent jetstream error codes by @Jarema in https://github.com/nats-io/nats.rs/pull/1564
+* Add server pool callback by @Jarema in https://github.com/nats-io/nats.rs/pull/1559
+* Add Source.consumer for durable sourcing by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add AckPolicy::FlowControl by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add Consumer Reset API by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add 2.14 schedule, batch, and rollup header constants by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add PublishAck batch_id and batch_size fields by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add `try_server_info` and `max_payload` methods by @yordis in https://github.com/nats-io/nats.rs/pull/1567
+
+## Fixed
+* Fix typo in create_or_update_key_value example by @ayymart in https://github.com/nats-io/nats.rs/pull/1569
+* Fix linter warning by @Jarema in https://github.com/nats-io/nats.rs/pull/1570
+* Preserve unsubscribe_after limit across reconnects by @MattPatchava in https://github.com/nats-io/nats.rs/pull/1560
+* Fix panic on reading non-utf8 data by @Jarema in https://github.com/nats-io/nats.rs/pull/1573
+
+## Changed
+* Bump rand by @Jarema in https://github.com/nats-io/nats.rs/pull/1566
+* Bump to thiserror v2 by @aumetra in https://github.com/nats-io/nats.rs/pull/1571
+* Orbit docs by @Jarema in https://github.com/nats-io/nats.rs/pull/1580
+* Cover remaining 2.14 server error codes and predefined cron schedules by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+
+## New Contributors
+* @ayymart made their first contribution in https://github.com/nats-io/nats.rs/pull/1569
+* @aumetra made their first contribution in https://github.com/nats-io/nats.rs/pull/1571
+* @yordis made their first contribution in https://github.com/nats-io/nats.rs/pull/1567
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.47.0...async-nats/v0.48.0
+# v0.47.0
+
+This release adds subject validation (with opt-out possibility) and wraps while connect attempt in timeout, making it more robust.
+
+## Added
+* Add Subject Validation by @Jarema in https://github.com/nats-io/nats.rs/pull/1525
+* Add respond_with_headers method to handle responses with custom headers by @giddyos in https://github.com/nats-io/nats.rs/pull/1554
+* Add local_address option to bind client to a specific local IP by @wallyqs in https://github.com/nats-io/nats.rs/pull/1539
+* Implement Clone for ConnectOptions by @MattPatchava in https://github.com/nats-io/nats.rs/pull/1552
+
+## Fixed
+* Fix invalid consumer rate limit json by @Totodore in https://github.com/nats-io/nats.rs/pull/1536
+* Return error instead of panic when reply subject is empty by @liamkinne in https://github.com/nats-io/nats.rs/pull/1514
+* Use proper doc comments by @Xaeroxe in https://github.com/nats-io/nats.rs/pull/1543
+* Fix connection_timeout to cover full NATS handshake by @rahsonaw in https://github.com/nats-io/nats.rs/pull/1544
+
+## Changed
+* Update rustls-native-certs from 0.7 to 0.8 by @FreeMasen in https://github.com/nats-io/nats.rs/pull/1507
+* Remove `once_cell` and use std::sync::LazyLock instead by @Jarema in https://github.com/nats-io/nats.rs/pull/1534
+* Bump bytes crate by @Jarema in https://github.com/nats-io/nats.rs/pull/1540
+* Bump msrv by @Jarema in https://github.com/nats-io/nats.rs/pull/1509
+* Update rustls-webpki to 0.103.10 by @JohnMoon-Voyager in https://github.com/nats-io/nats.rs/pull/1550
+* Update dictionary by @Jarema in https://github.com/nats-io/nats.rs/pull/1556
+
+## New Contributors
+* @FreeMasen made their first contribution in https://github.com/nats-io/nats.rs/pull/1507
+* @Xaeroxe made their first contribution in https://github.com/nats-io/nats.rs/pull/1543
+* @MattPatchava made their first contribution in https://github.com/nats-io/nats.rs/pull/1552
+* @JohnMoon-Voyager made their first contribution in https://github.com/nats-io/nats.rs/pull/1550
+* @giddyos made their first contribution in https://github.com/nats-io/nats.rs/pull/1554
+* @rahsonaw made their first contribution in https://github.com/nats-io/nats.rs/pull/1544
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.46.0...async-nats/v0.47.0
+
+
 # v0.46.0
 
 This release introduces disabled by default feature-gating of features and modules.

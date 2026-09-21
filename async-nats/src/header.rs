@@ -153,6 +153,19 @@ impl HeaderMap {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
+    /// produces), computed without allocating.
+    pub(crate) fn wire_len(&self) -> usize {
+        // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
+        let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
+        for (k, vs) in &self.inner {
+            for v in vs.iter() {
+                len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
+            }
+        }
+        len
+    }
 }
 
 impl HeaderMap {
@@ -372,10 +385,7 @@ impl FromStr for HeaderValue {
     type Err = ParseHeaderValueError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains(['\r', '\n']) {
-            return Err(ParseHeaderValueError);
-        }
-
+        validate_header_value(s)?;
         Ok(HeaderValue {
             inner: s.to_string(),
         })
@@ -384,6 +394,10 @@ impl FromStr for HeaderValue {
 
 impl From<&str> for HeaderValue {
     fn from(v: &str) -> Self {
+        assert!(
+            validate_header_value(v).is_ok(),
+            "invalid header value: cannot contain '\\r' or '\\n'"
+        );
         Self {
             inner: v.to_string(),
         }
@@ -392,6 +406,10 @@ impl From<&str> for HeaderValue {
 
 impl From<String> for HeaderValue {
     fn from(inner: String) -> Self {
+        assert!(
+            validate_header_value(&inner).is_ok(),
+            "invalid header value: cannot contain '\\r' or '\\n'"
+        );
         Self { inner }
     }
 }
@@ -420,22 +438,48 @@ impl fmt::Display for ParseHeaderValueError {
 
 impl std::error::Error for ParseHeaderValueError {}
 
+fn validate_header_value(s: &str) -> Result<(), ParseHeaderValueError> {
+    if s.contains(['\r', '\n']) {
+        Err(ParseHeaderValueError)
+    } else {
+        Ok(())
+    }
+}
+
 pub trait IntoHeaderName {
     fn into_header_name(self) -> HeaderName;
 }
 
 impl IntoHeaderName for &str {
     fn into_header_name(self) -> HeaderName {
-        HeaderName {
-            inner: HeaderRepr::Custom(self.into()),
+        assert!(
+            validate_header_name(self).is_ok(),
+            "invalid header name: cannot contain control characters, non-ASCII, or ':'"
+        );
+        match StandardHeader::from_bytes(self.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(self.into()),
+            },
         }
     }
 }
 
 impl IntoHeaderName for String {
     fn into_header_name(self) -> HeaderName {
-        HeaderName {
-            inner: HeaderRepr::Custom(self.into()),
+        assert!(
+            validate_header_name(&self).is_ok(),
+            "invalid header name: cannot contain control characters, non-ASCII, or ':'"
+        );
+        match StandardHeader::from_bytes(self.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(self.into()),
+            },
         }
     }
 }
@@ -452,15 +496,13 @@ pub trait IntoHeaderValue {
 
 impl IntoHeaderValue for &str {
     fn into_header_value(self) -> HeaderValue {
-        HeaderValue {
-            inner: self.to_string(),
-        }
+        HeaderValue::from(self)
     }
 }
 
 impl IntoHeaderValue for String {
     fn into_header_value(self) -> HeaderValue {
-        HeaderValue { inner: self }
+        HeaderValue::from(self)
     }
 }
 
@@ -564,7 +606,56 @@ standard_headers! {
     (NatsMessageTtl, NATS_MESSAGE_TTL, b"Nats-TTL");
     /// Reason why the delete marked on a stream with enabled markers was put.
     (NatsMarkerReason, NATS_MARKER_REASON, b"Nats-Marker-Reason");
+    /// Initiates a rollup of the given subject(s); valid values are `sub` and `all`.
+    (NatsRollup, NATS_ROLLUP, b"Nats-Rollup");
+    /// Schedule expression for a JetStream message scheduler entry. ADR-51.
+    (NatsSchedule, NATS_SCHEDULE, b"Nats-Schedule");
+    /// Target subject the schedule publishes to.
+    (NatsScheduleTarget, NATS_SCHEDULE_TARGET, b"Nats-Schedule-Target");
+    /// TTL applied to messages produced by the schedule.
+    (NatsScheduleTtl, NATS_SCHEDULE_TTL, b"Nats-Schedule-TTL");
+    /// Source subject sampled into the schedule output.
+    (NatsScheduleSource, NATS_SCHEDULE_SOURCE, b"Nats-Schedule-Source");
+    /// Time zone for cron schedules. Accepts IANA names like `America/New_York`.
+    (NatsScheduleTimeZone, NATS_SCHEDULE_TIME_ZONE, b"Nats-Schedule-Time-Zone");
+    /// Auto-applies a rollup on the schedule target. Currently only `sub` is valid.
+    (NatsScheduleRollup, NATS_SCHEDULE_ROLLUP, b"Nats-Schedule-Rollup");
+    /// On schedule-produced messages: the subject of the originating schedule.
+    (NatsScheduler, NATS_SCHEDULER, b"Nats-Scheduler");
+    /// On schedule-produced messages: timestamp of next firing or `purge` for delayed schedules.
+    (NatsScheduleNext, NATS_SCHEDULE_NEXT, b"Nats-Schedule-Next");
+    /// Atomic batch publish: batch id (max 64 chars).
+    (NatsBatchId, NATS_BATCH_ID, b"Nats-Batch-Id");
+    /// Atomic batch publish: per-message sequence within the batch.
+    (NatsBatchSequence, NATS_BATCH_SEQUENCE, b"Nats-Batch-Sequence");
+    /// Atomic batch publish: commit marker. `1` to commit and store the final
+    /// message; `eob` to commit without storing it (end-of-batch).
+    (NatsBatchCommit, NATS_BATCH_COMMIT, b"Nats-Batch-Commit");
+    /// Minimum JetStream API level the publishing client requires; the server
+    /// will reject the message (and the enclosing batch, if any) when its own
+    /// level is below the value set here.
+    (NatsRequiredApiLevel, NATS_REQUIRED_API_LEVEL, b"Nats-Required-Api-Level");
 }
+
+/// Value constant for [`NATS_BATCH_COMMIT`]: commit and store the final message.
+pub const NATS_BATCH_COMMIT_FINAL: &str = "1";
+/// Value constant for [`NATS_BATCH_COMMIT`]: commit without storing the final
+/// message (end-of-batch). Server is case-sensitive on this string.
+pub const NATS_BATCH_COMMIT_EOB: &str = "eob";
+/// Value constant for [`NATS_SCHEDULE_ROLLUP`]: rollup the schedule's target
+/// subject. Currently the only legal value.
+pub const NATS_SCHEDULE_ROLLUP_SUB: &str = "sub";
+
+/// Predefined [`NATS_SCHEDULE`] expression: run once a year at midnight Jan 1.
+pub const NATS_SCHEDULE_YEARLY: &str = "@yearly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a month at midnight on the 1st.
+pub const NATS_SCHEDULE_MONTHLY: &str = "@monthly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a week at midnight Sat→Sun.
+pub const NATS_SCHEDULE_WEEKLY: &str = "@weekly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a day at midnight.
+pub const NATS_SCHEDULE_DAILY: &str = "@daily";
+/// Predefined [`NATS_SCHEDULE`] expression: run once an hour at the top of the hour.
+pub const NATS_SCHEDULE_HOURLY: &str = "@hourly";
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct CustomHeader {
@@ -652,18 +743,42 @@ impl FromStr for HeaderName {
     type Err = ParseHeaderNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains(|c: char| c == ':' || (c as u8) < 33 || (c as u8) > 126) {
-            return Err(ParseHeaderNameError);
-        }
-
-        match StandardHeader::from_bytes(s.as_ref()) {
-            Some(v) => Ok(HeaderName {
+        validate_header_name(s)?;
+        Ok(match StandardHeader::from_bytes(s.as_bytes()) {
+            Some(v) => HeaderName {
                 inner: HeaderRepr::Standard(v),
-            }),
-            None => Ok(HeaderName {
+            },
+            None => HeaderName {
                 inner: HeaderRepr::Custom(CustomHeader::from(s)),
-            }),
-        }
+            },
+        })
+    }
+}
+
+/// Fallible conversion from a borrowed string slice; validates the name without panicking.
+impl TryFrom<&str> for HeaderName {
+    type Error = ParseHeaderNameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+/// Fallible conversion from an owned `String`; validates without panicking and
+/// avoids re-allocating the bytes when the result is a custom (non-standard) name.
+impl TryFrom<String> for HeaderName {
+    type Error = ParseHeaderNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_header_name(&value)?;
+        Ok(match StandardHeader::from_bytes(value.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(CustomHeader::from(value)),
+            },
+        })
     }
 }
 
@@ -715,6 +830,14 @@ impl std::fmt::Display for ParseHeaderNameError {
 }
 
 impl std::error::Error for ParseHeaderNameError {}
+
+fn validate_header_name(s: &str) -> Result<(), ParseHeaderNameError> {
+    if s.contains(|c: char| !c.is_ascii_graphic() || c == ':') {
+        Err(ParseHeaderNameError)
+    } else {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -793,6 +916,19 @@ mod tests {
         let bytes = headers.to_bytes();
 
         println!("bytes: {:?}", from_utf8(&bytes));
+    }
+
+    #[test]
+    fn wire_len_matches_serialized() {
+        let mut headers = HeaderMap::new();
+        headers.append("Key", "value");
+        headers.append("Key", "second_value");
+        headers.insert("Second", "SecondValue");
+        assert_eq!(headers.wire_len(), headers.to_bytes().len());
+
+        // An empty block still serializes the framing bytes.
+        let empty = HeaderMap::new();
+        assert_eq!(empty.wire_len(), empty.to_bytes().len());
     }
 
     #[test]
@@ -1021,6 +1157,105 @@ mod tests {
             header_map.get("Other-Header").unwrap().as_str(),
             "other-value"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header value")]
+    fn header_value_from_str_rejects_cr() {
+        let _: HeaderValue = "value\rwith\rcr".into();
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header value")]
+    fn header_value_from_str_rejects_lf() {
+        let _: HeaderValue = "value\nwith\nlf".into();
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header value")]
+    fn header_value_from_string_rejects_crlf() {
+        let _: HeaderValue = "injected\r\nPUB attack 0\r\n\r\n".to_string().into();
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header value")]
+    fn header_value_into_trait_rejects_crlf() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Key", "value\r\nPUB attack 0\r\n\r\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_cr() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad\rName", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_lf() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad\nName", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_space() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad Name", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_colon() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad:Name", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_from_string_rejects_control_chars() {
+        let name = "Bad\x00Name".to_string();
+        name.into_header_name();
+    }
+
+    #[test]
+    fn valid_header_values_still_work() {
+        let _: HeaderValue = "normal value".into();
+        let _: HeaderValue = "value with special chars !@#$%^&*()".into();
+        let _: HeaderValue = "".into();
+        let _: HeaderValue = String::from("string value").into();
+    }
+
+    #[test]
+    fn header_name_try_from_str() {
+        assert_eq!(
+            HeaderName::try_from("X-Custom").unwrap().as_str(),
+            "X-Custom"
+        );
+        assert!(HeaderName::try_from("Bad Name").is_err());
+        assert!(HeaderName::try_from("Bad:Name").is_err());
+    }
+
+    #[test]
+    fn header_name_try_from_string() {
+        assert_eq!(
+            HeaderName::try_from("Nats-Stream".to_string())
+                .unwrap()
+                .as_str(),
+            "Nats-Stream"
+        );
+        assert!(HeaderName::try_from("Bad\nName".to_string()).is_err());
+    }
+
+    #[test]
+    fn valid_header_names_still_work() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Custom-Header", "value");
+        headers.insert("Another-Header", "value");
+        headers.insert("$dollar", "value");
+        headers.insert("Nats-Stream", "value");
+        assert_eq!(headers.get("Nats-Stream").unwrap().as_str(), "value");
     }
 
     #[test]

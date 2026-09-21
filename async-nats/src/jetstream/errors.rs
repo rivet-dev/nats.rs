@@ -615,6 +615,75 @@ impl ErrorCode {
 
     /// Atomic publish batch commit invalid
     pub const ATOMIC_PUBLISH_INVALID_BATCH_COMMIT: ErrorCode = ErrorCode(10200);
+
+    /// Atomic publish batch contains duplicate message id
+    pub const ATOMIC_PUBLISH_CONTAINS_DUPLICATE_MESSAGE: ErrorCode = ErrorCode(10201);
+
+    /// Cluster member change is in progress
+    pub const CLUSTER_SERVER_MEMBER_CHANGE_INFLIGHT: ErrorCode = ErrorCode(10202);
+
+    /// Message schedules source is invalid
+    pub const MESSAGE_SCHEDULES_SOURCE_INVALID: ErrorCode = ErrorCode(10203);
+
+    /// Consumer invalid reset
+    pub const CONSUMER_INVALID_RESET: ErrorCode = ErrorCode(10204);
+
+    /// Batch publish is disabled
+    pub const BATCH_PUBLISH_DISABLED: ErrorCode = ErrorCode(10205);
+
+    /// Batch publish pattern is invalid
+    pub const BATCH_PUBLISH_INVALID_PATTERN: ErrorCode = ErrorCode(10206);
+
+    /// Batch publish ID is invalid
+    pub const BATCH_PUBLISH_INVALID_BATCH_ID: ErrorCode = ErrorCode(10207);
+
+    /// Batch publish ID unknown
+    pub const BATCH_PUBLISH_UNKNOWN_BATCH_ID: ErrorCode = ErrorCode(10208);
+
+    /// Stream mirrors can not also use batch publishing
+    pub const MIRROR_WITH_BATCH_PUBLISH: ErrorCode = ErrorCode(10209);
+
+    /// Atomic publish too many inflight
+    pub const ATOMIC_PUBLISH_TOO_MANY_INFLIGHT: ErrorCode = ErrorCode(10210);
+
+    /// Batch publish too many inflight
+    pub const BATCH_PUBLISH_TOO_MANY_INFLIGHT: ErrorCode = ErrorCode(10211);
+
+    /// Message schedules invalid scheduler
+    pub const MESSAGE_SCHEDULES_SCHEDULER_INVALID: ErrorCode = ErrorCode(10212);
+
+    /// Stream mirror consumer config is invalid
+    pub const MIRROR_DURABLE_CONSUMER_CFG_INVALID: ErrorCode = ErrorCode(10213);
+
+    /// Stream mirror consumer requires flow control ack policy
+    pub const MIRROR_CONSUMER_REQUIRES_ACK_FC: ErrorCode = ErrorCode(10214);
+
+    /// Stream source consumer config is invalid
+    pub const SOURCE_DURABLE_CONSUMER_CFG_INVALID: ErrorCode = ErrorCode(10215);
+
+    /// Duplicate stream source consumer detected
+    pub const SOURCE_DURABLE_CONSUMER_DUPLICATE_DETECTED: ErrorCode = ErrorCode(10216);
+
+    /// Stream source consumer requires flow control ack policy
+    pub const SOURCE_CONSUMER_REQUIRES_ACK_FC: ErrorCode = ErrorCode(10217);
+
+    /// Flow control ack policy requires a push based consumer
+    pub const CONSUMER_ACK_FC_REQUIRES_PUSH: ErrorCode = ErrorCode(10218);
+
+    /// Flow control ack policy requires flow control
+    pub const CONSUMER_ACK_FC_REQUIRES_FC: ErrorCode = ErrorCode(10219);
+
+    /// Flow control ack policy requires max ack pending
+    pub const CONSUMER_ACK_FC_REQUIRES_MAX_ACK_PENDING: ErrorCode = ErrorCode(10220);
+
+    /// Flow control ack policy requires unset ack wait
+    pub const CONSUMER_ACK_FC_REQUIRES_NO_ACK_WAIT: ErrorCode = ErrorCode(10221);
+
+    /// Flow control ack policy requires unset max deliver
+    pub const CONSUMER_ACK_FC_REQUIRES_NO_MAX_DELIVER: ErrorCode = ErrorCode(10222);
+
+    /// Message schedules time zone is invalid
+    pub const MESSAGE_SCHEDULES_TIME_ZONE_INVALID: ErrorCode = ErrorCode(10223);
 }
 
 /// `Error` type returned from an API response when an error occurs.

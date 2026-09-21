@@ -235,6 +235,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LANG: &str = "rust";
 const MAX_PENDING_PINGS: usize = 2;
 const MULTIPLEXER_SID: u64 = 0;
+pub(crate) const DEFAULT_SERVER_MAX_PAYLOAD: usize = 1024 * 1024;
 
 /// A re-export of the `rustls` crate used in this crate,
 /// for use in cases where manual client configurations
@@ -243,8 +244,9 @@ pub use tokio_rustls::rustls;
 
 use connection::{Connection, State};
 use connector::{Connector, ConnectorOptions};
+pub use connector::{ReconnectToServer, Server};
 pub use header::{HeaderMap, HeaderName, HeaderValue};
-pub use subject::Subject;
+pub use subject::{Subject, SubjectError, ToSubject};
 
 mod auth;
 pub(crate) mod auth_utils;
@@ -255,7 +257,9 @@ mod options;
 
 pub use auth::Auth;
 pub use client::{
-    Client, PublishError, Request, RequestError, RequestErrorKind, Statistics, SubscribeError,
+    Client, PublishError, PublishErrorKind, Request, RequestError, RequestErrorKind,
+    ServerPoolError, ServerPoolErrorKind, SetServerPoolError, SetServerPoolErrorKind, Statistics,
+    SubscribeError, SubscribeErrorKind,
 };
 pub use options::{AuthError, ConnectOptions};
 
@@ -400,6 +404,13 @@ pub(crate) enum Command {
         sid: Option<u64>,
     },
     Reconnect,
+    SetServerPool {
+        servers: Vec<ServerAddr>,
+        result: oneshot::Sender<Result<(), String>>,
+    },
+    ServerPool {
+        result: oneshot::Sender<Vec<connector::Server>>,
+    },
 }
 
 /// `ClientOp` represents all actions of `Client`.
@@ -449,7 +460,7 @@ pub(crate) struct ConnectionHandler {
     subscriptions: HashMap<u64, Subscription>,
     multiplexer: Option<Multiplexer>,
     pending_pings: usize,
-    info_sender: tokio::sync::watch::Sender<ServerInfo>,
+    info_sender: tokio::sync::watch::Sender<Option<ServerInfo>>,
     ping_interval: Interval,
     should_reconnect: bool,
     flush_observers: Vec<oneshot::Sender<()>>,
@@ -461,7 +472,7 @@ impl ConnectionHandler {
     pub(crate) fn new(
         connection: Connection,
         connector: Connector,
-        info_sender: tokio::sync::watch::Sender<ServerInfo>,
+        info_sender: tokio::sync::watch::Sender<Option<ServerInfo>>,
         ping_period: Duration,
     ) -> ConnectionHandler {
         let mut ping_interval = interval(ping_period);
@@ -842,8 +853,6 @@ impl ConnectionHandler {
     }
 
     fn handle_command(&mut self, command: Command) {
-        self.ping_interval.reset();
-
         match command {
             Command::Unsubscribe { sid, max } => {
                 if let Some(subscription) = self.subscriptions.get_mut(&sid) {
@@ -992,6 +1001,14 @@ impl ConnectionHandler {
             Command::Reconnect => {
                 self.should_reconnect = true;
             }
+
+            Command::SetServerPool { servers, result } => {
+                let _ = result.send(self.connector.set_server_pool(servers));
+            }
+
+            Command::ServerPool { result } => {
+                let _ = result.send(self.connector.server_pool());
+            }
         }
     }
 
@@ -1006,7 +1023,7 @@ impl ConnectionHandler {
     async fn handle_reconnect(&mut self) -> Result<(), ConnectError> {
         let (info, connection) = self.connector.connect().await?;
         self.connection = connection;
-        let _ = self.info_sender.send(info);
+        let _ = self.info_sender.send(Some(info));
 
         self.subscriptions
             .retain(|_, subscription| !subscription.sender.is_closed());
@@ -1017,6 +1034,13 @@ impl ConnectionHandler {
                 subject: subscription.subject.to_owned(),
                 queue_group: subscription.queue_group.to_owned(),
             });
+
+            if let Some(max) = subscription.max {
+                self.connection.enqueue_write_op(&ClientOp::Unsubscribe {
+                    sid: *sid,
+                    max: Some(max.saturating_sub(subscription.delivered)),
+                });
+            }
         }
 
         if let Some(multiplexer) = &self.multiplexer {
@@ -1054,7 +1078,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     let (events_tx, mut events_rx) = mpsc::channel(128);
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
     // We're setting it to the default server payload size.
-    let max_payload = Arc::new(AtomicUsize::new(1024 * 1024));
+    let max_payload = Arc::new(AtomicUsize::new(DEFAULT_SERVER_MAX_PAYLOAD));
     let statistics = Arc::new(Statistics::default());
 
     let mut connector = Connector::new(
@@ -1076,6 +1100,8 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             reconnect_delay_callback: options.reconnect_delay_callback,
             auth_callback: options.auth_callback,
             max_reconnects: options.max_reconnects,
+            local_address: options.local_address,
+            reconnect_to_server_callback: options.reconnect_to_server_callback,
         },
         events_tx,
         state_tx,
@@ -1084,13 +1110,13 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     )
     .map_err(|err| ConnectError::with_source(ConnectErrorKind::ServerParse, err))?;
 
-    let mut info: ServerInfo = Default::default();
+    let mut info = None;
     let mut connection = None;
     if !options.retry_on_initial_connect {
         debug!("retry on initial connect failure is disabled");
         let (info_ok, connection_ok) = connector.try_connect().await?;
         connection = Some(connection_ok);
-        info = info_ok;
+        info = Some(info_ok);
     }
 
     let (info_sender, info_watcher) = tokio::sync::watch::channel(info.clone());
@@ -1105,6 +1131,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         options.request_timeout,
         max_payload,
         statistics,
+        options.skip_subject_validation,
     );
 
     task::spawn(async move {
@@ -1125,7 +1152,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
                     return;
                 }
             };
-            info_sender.send(info).ok();
+            info_sender.send(Some(info)).ok();
             connection = Some(connection_ok);
         }
         let connection = connection.unwrap();
@@ -1522,9 +1549,7 @@ impl Stream for Subscriber {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(message)) => {
-                self.statistics
-                    .pending_messages
-                    .sub(1, Ordering::Relaxed);
+                self.statistics.pending_messages.sub(1, Ordering::Relaxed);
                 self.statistics
                     .pending_bytes
                     .sub(message.length as u64, Ordering::Relaxed);
@@ -1591,12 +1616,18 @@ pub enum ServerError {
 pub enum ClientError {
     Other(String),
     MaxReconnects,
+    /// The reconnect-to-server callback returned a server address that is not
+    /// present in the current server pool.
+    ServerNotInPool,
 }
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Other(error) => write!(f, "nats: {error}"),
             Self::MaxReconnects => write!(f, "nats: max reconnects reached"),
+            Self::ServerNotInPool => {
+                write!(f, "nats: reconnect callback returned server not in pool")
+            }
         }
     }
 }
@@ -1895,13 +1926,50 @@ impl<T: ToServerAddrs + ?Sized> ToServerAddrs for &T {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn is_valid_subject<T: AsRef<str>>(subject: T) -> bool {
-    let subject_str = subject.as_ref();
-    !subject_str.starts_with('.')
-        && !subject_str.ends_with('.')
-        && subject_str.bytes().all(|c| !c.is_ascii_whitespace())
+/// Checks if a subject contains only protocol-safe characters.
+/// Rejects empty subjects and subjects containing whitespace characters
+/// (space, tab, CR, LF) which would break protocol framing.
+/// Used for publish paths. Matches nats.go `validateSubject`.
+pub(crate) fn is_valid_publish_subject<T: AsRef<str>>(subject: T) -> bool {
+    let bytes = subject.as_ref().as_bytes();
+
+    if bytes.is_empty() {
+        return false;
+    }
+
+    memchr::memchr3(b' ', b'\r', b'\n', bytes).is_none() && memchr::memchr(b'\t', bytes).is_none()
 }
+
+/// Checks if a subject is structurally valid for subscribing.
+/// In addition to protocol-framing checks, also rejects invalid dot structure
+/// (leading/trailing dots, consecutive dots). Matches nats.go `badSubject`.
+pub(crate) fn is_valid_subject<T: AsRef<str>>(subject: T) -> bool {
+    let bytes = subject.as_ref().as_bytes();
+
+    if bytes.is_empty() {
+        return false;
+    }
+
+    bytes[0] != b'.'
+        && bytes[bytes.len() - 1] != b'.'
+        && memchr::memmem::find(bytes, b"..").is_none()
+        && memchr::memchr3(b' ', b'\r', b'\n', bytes).is_none()
+        && memchr::memchr(b'\t', bytes).is_none()
+}
+
+/// Checks if a queue group name is valid for the NATS protocol.
+/// Queue groups must not be empty and must not contain whitespace characters
+/// (space, tab, CR, LF) which would break protocol framing.
+pub(crate) fn is_valid_queue_group(queue_group: &str) -> bool {
+    let bytes = queue_group.as_bytes();
+
+    if bytes.is_empty() {
+        return false;
+    }
+
+    memchr::memchr3(b' ', b'\r', b'\n', bytes).is_none() && memchr::memchr(b'\t', bytes).is_none()
+}
+
 #[allow(unused_macros)]
 macro_rules! from_with_timeout {
     ($t:ty, $k:ty, $origin: ty, $origin_kind: ty) => {
