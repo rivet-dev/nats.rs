@@ -85,11 +85,13 @@ pub mod traits {
     }
 
     pub trait Publisher {
-        fn publish<S: ToSubject>(
+        fn publish<S>(
             &self,
             subject: S,
             payload: Bytes,
-        ) -> impl Future<Output = Result<super::PublishAckFuture, super::PublishError>>;
+        ) -> impl Future<Output = Result<super::PublishAckFuture, super::PublishError>>
+        where
+            S: ToSubject;
 
         fn publish_message(
             &self,
@@ -483,6 +485,22 @@ impl Context {
         subject: S,
         publish: PublishMessage,
     ) -> Result<PublishAckFuture, PublishError> {
+        let subject = self
+            .client
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::Other, e))?;
+
+        // Reject oversized messages before taking an ack permit, else the
+        // publish is sent and we wait for an ack that never arrives.
+        self.client
+            .check_payload_size(publish.headers.as_ref(), publish.payload.len())
+            .map_err(|sizes| {
+                PublishError::with_source(
+                    PublishErrorKind::MaxPayloadExceeded,
+                    crate::client::max_payload_message(sizes),
+                )
+            })?;
+
         let permit = if self.backpressure_on_inflight {
             // When backpressure is enabled, wait for a permit to become available
             self.max_ack_semaphore
@@ -502,7 +520,7 @@ impl Context {
                     _ => PublishError::with_source(PublishErrorKind::Other, err),
                 })?
         };
-        let subject = subject.to_subject();
+
         let (sender, receiver) = oneshot::channel();
 
         let respond = self.client.new_inbox().into();
@@ -1162,7 +1180,7 @@ impl Context {
     /// let client = async_nats::connect("demo.nats.io:4222").await?;
     /// let jetstream = async_nats::jetstream::new(client);
     /// let kv = jetstream
-    ///     .update_key_value(async_nats::jetstream::kv::Config {
+    ///     .create_or_update_key_value(async_nats::jetstream::kv::Config {
     ///         bucket: "kv".to_string(),
     ///         history: 60,
     ///         ..Default::default()
@@ -1732,12 +1750,16 @@ impl crate::client::traits::Requester for Context {
 }
 
 impl crate::client::traits::Publisher for Context {
-    fn publish_with_reply<S: ToSubject, R: ToSubject>(
+    fn publish_with_reply<S, R>(
         &self,
         subject: S,
         reply: R,
         payload: Bytes,
-    ) -> impl Future<Output = Result<(), crate::PublishError>> {
+    ) -> impl Future<Output = Result<(), crate::PublishError>>
+    where
+        S: ToSubject,
+        R: ToSubject,
+    {
         self.client.publish_with_reply(subject, reply, payload)
     }
 
@@ -1817,6 +1839,8 @@ pub enum PublishErrorKind {
     TimedOut,
     BrokenPipe,
     MaxAckPending,
+    /// The message (payload plus headers) exceeds the server's `max_payload`.
+    MaxPayloadExceeded,
     Other,
 }
 
@@ -1830,6 +1854,7 @@ impl Display for PublishErrorKind {
             Self::WrongLastMessageId => write!(f, "wrong last message id"),
             Self::WrongLastSequence => write!(f, "wrong last sequence"),
             Self::MaxAckPending => write!(f, "max ack pending reached"),
+            Self::MaxPayloadExceeded => write!(f, "max payload size exceeded"),
         }
     }
 }
@@ -2069,6 +2094,7 @@ pub type Publish = super::message::PublishMessage;
 pub enum RequestErrorKind {
     NoResponders,
     TimedOut,
+    InvalidSubject,
     Other,
 }
 
@@ -2077,6 +2103,7 @@ impl Display for RequestErrorKind {
         match self {
             Self::TimedOut => write!(f, "timed out"),
             Self::Other => write!(f, "request failed"),
+            Self::InvalidSubject => write!(f, "invalid subject"),
             Self::NoResponders => write!(f, "requested JetStream resource does not exist"),
         }
     }
@@ -2093,7 +2120,10 @@ impl From<crate::RequestError> for RequestError {
             crate::RequestErrorKind::NoResponders => {
                 RequestError::new(RequestErrorKind::NoResponders)
             }
-            crate::RequestErrorKind::Other => {
+            crate::RequestErrorKind::InvalidSubject => {
+                RequestError::with_source(RequestErrorKind::InvalidSubject, error)
+            }
+            crate::RequestErrorKind::MaxPayloadExceeded | crate::RequestErrorKind::Other => {
                 RequestError::with_source(RequestErrorKind::Other, error)
             }
         }
@@ -2154,6 +2184,9 @@ impl From<RequestError> for ConsumerInfoError {
     fn from(error: RequestError) -> Self {
         match error.kind() {
             RequestErrorKind::TimedOut => ConsumerInfoError::new(ConsumerInfoErrorKind::TimedOut),
+            RequestErrorKind::InvalidSubject => {
+                ConsumerInfoError::with_source(ConsumerInfoErrorKind::InvalidName, error)
+            }
             RequestErrorKind::Other => {
                 ConsumerInfoError::with_source(ConsumerInfoErrorKind::Request, error)
             }
@@ -2213,6 +2246,9 @@ impl From<RequestError> for CreateStreamError {
                 CreateStreamError::new(CreateStreamErrorKind::JetStreamUnavailable)
             }
             RequestErrorKind::TimedOut => CreateStreamError::new(CreateStreamErrorKind::TimedOut),
+            RequestErrorKind::InvalidSubject => {
+                CreateStreamError::with_source(CreateStreamErrorKind::InvalidStreamName, error)
+            }
             RequestErrorKind::Other => {
                 CreateStreamError::with_source(CreateStreamErrorKind::Response, error)
             }
@@ -2406,7 +2442,9 @@ impl From<RequestError> for AccountError {
                 AccountError::with_source(AccountErrorKind::JetStreamUnavailable, err)
             }
             RequestErrorKind::TimedOut => AccountError::new(AccountErrorKind::TimedOut),
-            RequestErrorKind::Other => AccountError::with_source(AccountErrorKind::Other, err),
+            RequestErrorKind::Other | RequestErrorKind::InvalidSubject => {
+                AccountError::with_source(AccountErrorKind::Other, err)
+            }
         }
     }
 }

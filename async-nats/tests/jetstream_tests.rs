@@ -104,6 +104,41 @@ mod jetstream {
     }
 
     #[tokio::test]
+    async fn publish_payload_size() {
+        let server = nats_server::run_server("tests/configs/jetstream_max_payload.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        assert_eq!(client.max_payload(), 1024 * 128);
+        let context = async_nats::jetstream::new(client);
+
+        context
+            .create_stream(stream::Config {
+                name: "TEST".into(),
+                subjects: vec!["foo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Oversized publish fails fast with a typed error, not an ack timeout.
+        let err = context
+            .publish("foo", vec![0u8; 1024 * 1024].into())
+            .await
+            .unwrap_err()
+            .kind();
+        assert_eq!(err, PublishErrorKind::MaxPayloadExceeded);
+
+        // Headers count toward the limit too.
+        let mut headers = HeaderMap::new();
+        headers.insert("Key", "Value");
+        let err = context
+            .publish_with_headers("foo", headers, vec![0u8; 1024 * 128].into())
+            .await
+            .unwrap_err()
+            .kind();
+        assert_eq!(err, PublishErrorKind::MaxPayloadExceeded);
+    }
+
+    #[tokio::test]
     async fn publish_async() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = async_nats::connect(server.client_url()).await.unwrap();
@@ -1545,6 +1580,154 @@ mod jetstream {
             let message = message.unwrap();
             assert_eq!(i + 1, message.info().unwrap().stream_sequence as usize);
             assert_eq!(message.status, None);
+        }
+    }
+
+    // Regression test for #1596: an ordered push consumer that is *not* being polled across a
+    // server restart must still recreate its consumer and resume delivery once polling resumes,
+    // instead of surfacing "missed idle heartbeat" and then hanging forever. The actively-polled
+    // path recovers via connection-state transitions (see `push_ordered_recreate`); the idle path
+    // can only recover via the idle-heartbeat monitor, which must trigger recreation.
+    #[tokio::test]
+    async fn push_ordered_recreate_after_idle_restart() {
+        let mut server =
+            nats_server::run_server_with_port("tests/configs/jetstream.conf", Some("5657"));
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client.clone());
+
+        context
+            .create_stream(stream::Config {
+                name: "events".into(),
+                subjects: vec!["events.>".into()],
+                storage: StorageType::File,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let stream = context.get_stream("events").await.unwrap();
+        let consumer: OrderedPushConsumer = stream
+            .create_consumer(consumer::push::OrderedConfig {
+                deliver_subject: "push".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut messages = consumer.messages().await.unwrap();
+
+        // Warm the consumer with one live delivery so it has a known last sequence to resume from.
+        context.publish("events.1", "1".into()).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), messages.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.info().unwrap().stream_sequence, 1);
+
+        // Restart the server while the consumer stream is idle (no `next()` in flight).
+        server.restart();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if client.connection_state() == State::Connected {
+                break;
+            }
+        }
+
+        // Publish after the restart, then resume polling. Before the fix the first poll yields
+        // Err(MissingHeartbeat) and every subsequent poll hangs; the post-restart message is lost.
+        context.publish("events.2", "2".into()).await.unwrap();
+
+        // The missed-heartbeat error may surface once, but it must trigger consumer recreation
+        // rather than a terminal hang, so the post-restart message is eventually delivered.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "ordered consumer never recovered after an idle server restart"
+            );
+            match tokio::time::timeout(remaining, messages.next()).await {
+                Ok(Some(Ok(message))) => {
+                    if message.info().unwrap().stream_sequence == 2 {
+                        assert_eq!(message.payload.as_ref(), b"2");
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) => continue,
+                Ok(None) => panic!("ordered consumer stream ended unexpectedly"),
+                Err(_) => panic!("ordered consumer hung; never recovered after an idle restart"),
+            }
+        }
+    }
+
+    // Companion to #1596: the idle-heartbeat recreation must not discard messages that are
+    // already buffered in the subscription. If the application simply pauses for longer than the
+    // heartbeat window while the consumer is alive and has queued messages, resuming must deliver
+    // all of them in order without surfacing a (false) "missed idle heartbeat" — otherwise, with
+    // AckPolicy::None, those buffered messages can be lost on capped/discarding streams.
+    #[tokio::test]
+    async fn push_ordered_buffered_messages_survive_idle() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client.clone());
+
+        context
+            .create_stream(stream::Config {
+                name: "bursts".into(),
+                subjects: vec!["bursts.>".into()],
+                storage: StorageType::File,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let stream = context.get_stream("bursts").await.unwrap();
+        let consumer: OrderedPushConsumer = stream
+            .create_consumer(consumer::push::OrderedConfig {
+                deliver_subject: "push".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut messages = consumer.messages().await.unwrap();
+
+        // Establish the consumer with one live delivery, then leave the heartbeat timer armed by
+        // forcing a poll that finds the channel empty (the timeout drives one `Pending` poll).
+        context.publish("bursts.1", "1".into()).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), messages.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.payload.as_ref(), b"1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), messages.next())
+                .await
+                .is_err(),
+            "expected no further messages yet"
+        );
+
+        // Publish a burst, then pause longer than ORDERED_IDLE_HEARTBEAT * 2 (10s) without polling.
+        // The burst buffers in the subscription while the heartbeat deadline elapses.
+        for i in 2..=6 {
+            context
+                .publish(format!("bursts.{i}"), i.to_string().into())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // Resuming must drain the whole buffered burst, in order, with no error.
+        for i in 2..=6 {
+            let message = tokio::time::timeout(Duration::from_secs(5), messages.next())
+                .await
+                .expect("timed out waiting for buffered message")
+                .expect("stream ended unexpectedly")
+                .expect("buffered message was dropped on a false heartbeat timeout");
+            assert_eq!(message.payload.as_ref(), i.to_string().as_bytes());
+            assert_eq!(message.info().unwrap().stream_sequence, i);
         }
     }
 
@@ -4241,6 +4424,153 @@ mod jetstream {
         assert!(consumer.info().await.unwrap().paused);
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         assert!(!consumer.info().await.unwrap().paused);
+    }
+
+    #[cfg(feature = "server_2_14")]
+    #[tokio::test]
+    async fn allow_batch_publish_round_trip() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        let stream = jetstream
+            .create_stream(stream::Config {
+                name: "BATCH".to_string(),
+                subjects: vec!["batch.>".to_string()],
+                allow_batch_publish: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(stream.cached_info().config.allow_batch_publish);
+
+        let info = jetstream
+            .get_stream("BATCH")
+            .await
+            .unwrap()
+            .info()
+            .await
+            .unwrap()
+            .clone();
+        assert!(info.config.allow_batch_publish);
+    }
+
+    #[cfg(feature = "server_2_14")]
+    #[tokio::test]
+    async fn source_consumer_round_trip() {
+        use async_nats::jetstream::stream::{Source, StreamConsumerSource};
+
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        // Source stream + a durable consumer the aggregate will use.
+        jetstream
+            .create_stream(stream::Config {
+                name: "ORIGIN".to_string(),
+                subjects: vec!["origin.>".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let aggregate = jetstream
+            .create_stream(stream::Config {
+                name: "AGG".to_string(),
+                sources: Some(vec![Source {
+                    name: "ORIGIN".to_string(),
+                    consumer: Some(StreamConsumerSource::new("agg-consumer", "agg.deliver")),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let sources = aggregate.cached_info().config.sources.clone().unwrap();
+        let cs = sources[0].consumer.clone().unwrap();
+        assert_eq!(cs.name, "agg-consumer");
+        assert_eq!(cs.deliver_subject, "agg.deliver");
+
+        // Fresh fetch — confirm the server actually persisted `consumer`.
+        let mut fresh = jetstream.get_stream("AGG").await.unwrap();
+        let info = fresh.info().await.unwrap();
+        let cs = info.config.sources.clone().unwrap()[0]
+            .consumer
+            .clone()
+            .unwrap();
+        assert_eq!(cs.name, "agg-consumer");
+        assert_eq!(cs.deliver_subject, "agg.deliver");
+    }
+
+    #[cfg(feature = "server_2_14")]
+    #[tokio::test]
+    async fn consumer_reset() {
+        use bytes::Bytes;
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        let stream = jetstream
+            .create_stream(stream::Config {
+                name: "RESET".to_string(),
+                subjects: vec!["reset.>".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for i in 0..5u64 {
+            jetstream
+                .publish(format!("reset.{i}"), Bytes::from_static(b"x"))
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+
+        let mut consumer = stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("c".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Reset to a specific seq.
+        let resp = consumer.reset(Some(3)).await.unwrap();
+        assert_eq!(resp.reset_seq, 3);
+
+        // Empty / None reset reports the ack-floor stream-seq the consumer
+        // is now sitting at — after the previous `Some(3)` call that's still 3.
+        let resp = consumer.reset(None).await.unwrap();
+        assert_eq!(resp.reset_seq, 3);
+
+        // Stream-level call also works and round-trips the requested seq.
+        let resp = stream.reset_consumer("c", Some(2)).await.unwrap();
+        assert_eq!(resp.reset_seq, 2);
+
+        // Reset below the configured `OptStartSeq` is rejected by the server.
+        let pinned = stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("pinned".to_string()),
+                deliver_policy: consumer::DeliverPolicy::ByStartSequence { start_sequence: 3 },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let err = stream.reset_consumer("pinned", Some(1)).await.unwrap_err();
+        assert_eq!(err.kind(), stream::ConsumerResetErrorKind::InvalidReset);
+        let _ = pinned;
     }
 
     #[cfg(feature = "server_2_11")]

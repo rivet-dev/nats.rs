@@ -13,16 +13,18 @@
 
 use crate::auth::Auth;
 use crate::connector;
-use crate::{Client, ConnectError, Event, ToServerAddrs};
+use crate::connector::{ReconnectToServer, ReconnectToServerCallback, Server};
+use crate::{Client, ConnectError, Event, ServerInfo, ToServerAddrs};
 #[cfg(feature = "nkeys")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 #[cfg(feature = "nkeys")]
 use base64::engine::Engine;
 use futures_util::Future;
 use std::fmt::Formatter;
-use std::{fmt, path::PathBuf, pin::Pin, time::Duration};
+use std::net::SocketAddr;
 #[cfg(feature = "nkeys")]
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::{fmt, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 #[cfg(feature = "nkeys")]
 use tokio::io;
 use tokio_rustls::rustls;
@@ -40,6 +42,7 @@ use tokio_rustls::rustls;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub(crate) name: Option<String>,
     pub(crate) no_echo: bool,
@@ -62,8 +65,11 @@ pub struct ConnectOptions {
     pub(crate) ignore_discovered_servers: bool,
     pub(crate) retain_servers_order: bool,
     pub(crate) read_buffer_capacity: u16,
-    pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
+    pub(crate) reconnect_delay_callback: Arc<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) skip_subject_validation: bool,
+    pub(crate) local_address: Option<SocketAddr>,
+    pub(crate) reconnect_to_server_callback: Option<ReconnectToServerCallback>,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -84,6 +90,7 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
+            .entry(&"skip_subject_validation", &self.skip_subject_validation)
             .finish()
     }
 }
@@ -111,11 +118,14 @@ impl Default for ConnectOptions {
             ignore_discovered_servers: false,
             retain_servers_order: false,
             read_buffer_capacity: 65535,
-            reconnect_delay_callback: Box::new(|attempts| {
+            reconnect_delay_callback: Arc::new(|attempts| {
                 connector::reconnect_delay_callback_default(attempts)
             }),
             auth: Default::default(),
             auth_callback: None,
+            skip_subject_validation: false,
+            local_address: None,
+            reconnect_to_server_callback: None,
         }
     }
 }
@@ -197,7 +207,7 @@ impl ConnectOptions {
         Fut: Future<Output = std::result::Result<Auth, AuthError>> + 'static + Send + Sync,
     {
         let mut options = ConnectOptions::new();
-        options.auth_callback = Some(CallbackArg1::<Vec<u8>, Result<Auth, AuthError>>(Box::new(
+        options.auth_callback = Some(CallbackArg1::<Vec<u8>, Result<Auth, AuthError>>(Arc::new(
             move |nonce| Box::pin(callback(nonce)),
         )));
         options
@@ -384,7 +394,7 @@ impl ConnectOptions {
     {
         let sign_cb = Arc::new(sign_cb);
 
-        let jwt_sign_callback = CallbackArg1(Box::new(move |nonce: String| {
+        let jwt_sign_callback = CallbackArg1(Arc::new(move |nonce: String| {
             let sign_cb = sign_cb.clone();
             Box::pin(async move {
                 let sig = sign_cb(nonce.as_bytes().to_vec())
@@ -639,8 +649,10 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets a timeout for the underlying TcpStream connection to avoid hangs and deadlocks.
-    /// Default is set to 5 seconds.
+    /// Sets a timeout for the full connection establishment and handshake to avoid
+    /// hangs and deadlocks. This includes TCP/WebSocket connection, TLS setup,
+    /// waiting for the server INFO message, sending CONNECT/PING, and receiving
+    /// the initial server PONG response. Default is set to 5 seconds.
     ///
     /// # Examples
     /// ```no_run
@@ -741,7 +753,7 @@ impl ConnectOptions {
         F: Fn(Event) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static + Send + Sync,
     {
-        self.event_callback = Some(CallbackArg1::<Event, ()>(Box::new(move |event| {
+        self.event_callback = Some(CallbackArg1::<Event, ()>(Arc::new(move |event| {
             Box::pin(cb(event))
         })));
         self
@@ -767,7 +779,49 @@ impl ConnectOptions {
     where
         F: Fn(usize) -> Duration + Send + Sync + 'static,
     {
-        self.reconnect_delay_callback = Box::new(cb);
+        self.reconnect_delay_callback = Arc::new(cb);
+        self
+    }
+
+    /// Sets a callback invoked on each reconnect attempt to select a specific
+    /// server from the pool.
+    ///
+    /// The callback receives a snapshot of available servers (with per-server
+    /// metadata such as reconnect count) and the last known [`ServerInfo`].
+    /// It should return a [`ReconnectToServer`] specifying which server to try
+    /// and how long to wait, or `None` to use default server selection.
+    ///
+    /// If the returned server address is not in the pool, the library falls back
+    /// to default selection and emits a [`ClientError`][crate::ClientError] event.
+    ///
+    /// When this callback returns `Some`, its delay takes precedence over
+    /// [`reconnect_delay_callback`][ConnectOptions::reconnect_delay_callback].
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .reconnect_to_server_callback(|servers, _info| async move {
+    ///         // Always try the first available server immediately.
+    ///         servers.first().map(|s| async_nats::ReconnectToServer {
+    ///             addr: s.addr.clone(),
+    ///             delay: Some(std::time::Duration::ZERO),
+    ///         })
+    ///     })
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn reconnect_to_server_callback<F, Fut>(mut self, cb: F) -> ConnectOptions
+    where
+        F: Fn(Vec<Server>, ServerInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<ReconnectToServer>> + Send + Sync + 'static,
+    {
+        self.reconnect_to_server_callback = Some(CallbackArg1(Arc::new(move |(servers, info)| {
+            Box::pin(cb(servers, info))
+        })));
         self
     }
 
@@ -862,6 +916,35 @@ impl ConnectOptions {
         self
     }
 
+    /// Disables subject validation for publish operations.
+    ///
+    /// By default, the client validates publish subjects to ensure they don't contain
+    /// whitespace characters (space, tab, CR, LF).
+    ///
+    /// This option only affects **publish** validation. Subscribe and queue group
+    /// validation always runs regardless of this setting, matching the behavior
+    /// of the Go and Java NATS clients.
+    ///
+    /// # Warning
+    /// Using invalid subjects may cause protocol errors with the NATS server.
+    /// Only disable validation if you are certain all published subjects are valid.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .skip_subject_validation(true)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn skip_subject_validation(mut self, skip: bool) -> ConnectOptions {
+        self.skip_subject_validation = skip;
+        self
+    }
+
     /// By default, a server may advertise other servers in the cluster known to it.
     /// By setting this option, the client will ignore the advertised servers.
     /// This may be useful if the client may not be able to reach them.
@@ -924,11 +1007,44 @@ impl ConnectOptions {
         self.read_buffer_capacity = size;
         self
     }
+
+    /// Sets the local socket address that the client will bind to when connecting
+    /// to the server. This is useful when the client machine has multiple
+    /// network interfaces and you want to control which one is used, or when
+    /// you need to bind to a specific local port.
+    ///
+    /// Use port `0` to let the operating system assign an ephemeral port.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// // Bind to a specific IP with an OS-assigned port
+    /// let addr: std::net::SocketAddr = "192.168.1.10:0".parse().unwrap();
+    /// async_nats::ConnectOptions::new()
+    ///     .local_address(addr)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    ///
+    /// // Bind to a specific IP and port
+    /// let addr: std::net::SocketAddr = "192.168.1.10:9898".parse().unwrap();
+    /// async_nats::ConnectOptions::new()
+    ///     .local_address(addr)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn local_address(mut self, address: SocketAddr) -> ConnectOptions {
+        self.local_address = Some(address);
+        self
+    }
 }
 
 pub(crate) type AsyncCallbackArg1<A, T> =
-    Box<dyn Fn(A) -> Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>> + Send + Sync>;
+    Arc<dyn Fn(A) -> Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>> + Send + Sync>;
 
+#[derive(Clone)]
 pub(crate) struct CallbackArg1<A, T>(AsyncCallbackArg1<A, T>);
 
 impl<A, T> CallbackArg1<A, T> {
